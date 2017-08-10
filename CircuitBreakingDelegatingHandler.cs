@@ -8,6 +8,7 @@ using Polly;
 using Polly.Timeout;
 using System.Threading;
 using Polly.CircuitBreaker;
+using Polly.Retry;
 
 namespace ConsoleApplication2
 {
@@ -15,11 +16,12 @@ namespace ConsoleApplication2
     {
         private readonly int _exceptionsAllowedBeforeBreaking;
         private readonly TimeSpan _durationOfBreak;
-        private readonly Policy _circuitBreakerPolicy;
+        private readonly CircuitBreakerPolicy _circuitBreakerPolicy;
         private readonly TimeoutPolicy _timeoutPolicy;
+        private readonly RetryPolicy _retryPolicy;
         public CircuitBreakingDelegatingHandler(HttpMessageHandler innerHandler) : base(innerHandler)
         {
-            this._exceptionsAllowedBeforeBreaking = 3;
+            this._exceptionsAllowedBeforeBreaking = 5;
             this._durationOfBreak = TimeSpan.FromSeconds(1);
             this._circuitBreakerPolicy = Policy.Handle<Exception>()
                 .Or<HttpRequestException>()
@@ -38,17 +40,18 @@ namespace ConsoleApplication2
                 {
                     Console.WriteLine($".Breaker logging: Half-open; next call is a trial.");
                 });
-            _timeoutPolicy = Policy.TimeoutAsync(TimeSpan.FromMilliseconds(100), TimeoutStrategy.Optimistic);
+            _timeoutPolicy = Policy.TimeoutAsync(TimeSpan.FromMilliseconds(120), TimeoutStrategy.Optimistic);
+            _retryPolicy = Policy.Handle<Exception>().WaitAndRetryAsync(3, count => TimeSpan.FromSeconds(Math.Pow(2, count)));
         }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
-        {            
+        {
             try
             {
-                var policyResult = await Policy.WrapAsync(_circuitBreakerPolicy, _timeoutPolicy).ExecuteAndCaptureAsync<HttpResponseMessage>(() =>
-                 {
-                     return base.SendAsync(request, cancellationToken);
-                 });
+                var policyResult = await Policy.WrapAsync(_circuitBreakerPolicy, _timeoutPolicy, _retryPolicy).ExecuteAndCaptureAsync<HttpResponseMessage>((ct) =>
+                        {
+                            return base.SendAsync(request, ct);
+                        }, cancellationToken);
                 if (policyResult != null && policyResult.FinalException != null)
                 {
                     return await Task<HttpResponseMessage>.FromResult(new HttpResponseMessage() { StatusCode = System.Net.HttpStatusCode.InternalServerError });
@@ -57,7 +60,7 @@ namespace ConsoleApplication2
             }
             catch (BrokenCircuitException ex)
             {
-                Console.WriteLine($"Reached to allowed number of exceptions. Circuit is open. AllowedExceptionCount: {_exceptionsAllowedBeforeBreaking}, DurationOfBreak: {_durationOfBreak} ex={ex.Message}");                
+                Console.WriteLine($"Reached to allowed number of exceptions. Circuit is open. AllowedExceptionCount: {_exceptionsAllowedBeforeBreaking}, DurationOfBreak: {_durationOfBreak} ex={ex.Message}");
             }
             catch (HttpRequestException)
             {
